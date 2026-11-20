@@ -7,7 +7,10 @@ import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.PriorityQueue;
 
 /**
  * High-Speed Zero-Allocation 5-Stage Optical Mark Recognition (OMR) Engine (v2.3 Continuous Stream + Multi-Template):
@@ -95,11 +98,11 @@ public class OmrNativeCvEngine {
         }
     }
 
-    private static class VerticalTriplet {
-        final Pt top, mid, bot;
+    private static class VerticalTriplet<T extends Pt> {
+        final T top, mid, bot;
         final float avgX;
 
-        VerticalTriplet(Pt top, Pt mid, Pt bot) {
+        VerticalTriplet(T top, T mid, T bot) {
             this.top = top;
             this.mid = mid;
             this.bot = bot;
@@ -114,6 +117,8 @@ public class OmrNativeCvEngine {
         public final boolean isCorrect;
         public final boolean isMultipleMark;
         public final boolean isBlank;
+        public final boolean needsReview;
+        public final String reviewReason;
         public final float[] densities;
         public final float[] optSrcX;
         public final float[] optSrcY;
@@ -125,6 +130,8 @@ public class OmrNativeCvEngine {
             boolean isCorrect,
             boolean isMulti,
             boolean isBlank,
+            boolean needsReview,
+            String reviewReason,
             float[] densities,
             float[] optSrcX,
             float[] optSrcY
@@ -135,6 +142,8 @@ public class OmrNativeCvEngine {
             this.isCorrect = isCorrect;
             this.isMultipleMark = isMulti;
             this.isBlank = isBlank;
+            this.needsReview = needsReview;
+            this.reviewReason = reviewReason;
             this.densities = densities;
             this.optSrcX = optSrcX;
             this.optSrcY = optSrcY;
@@ -150,6 +159,12 @@ public class OmrNativeCvEngine {
         public final int scorePercent;
         public final String decodedStudentId;
         public final String detectedFormName;
+        public final String detectedTemplateCode;
+        public final boolean geometryValid;
+        /** Selection matches a known layout/count; this is not exam identity verification. */
+        public final boolean templateSelectionValid;
+        public final boolean needsReview;
+        public final List<String> reviewReasons;
         public final boolean is10QForm;
         public final boolean locked6Fiducials;
         public final DetectedFiducials fiducials;
@@ -171,6 +186,9 @@ public class OmrNativeCvEngine {
             int scorePercent,
             String decodedStudentId,
             String detectedFormName,
+            String detectedTemplateCode,
+            boolean templateSelectionValid,
+            boolean questionCountMatches,
             boolean is10QForm,
             boolean locked6Fiducials,
             DetectedFiducials fiducials,
@@ -191,8 +209,23 @@ public class OmrNativeCvEngine {
             this.scorePercent = scorePercent;
             this.decodedStudentId = decodedStudentId;
             this.detectedFormName = detectedFormName;
+            this.detectedTemplateCode = detectedTemplateCode;
+            this.geometryValid = OmrDecisionRules.geometryValid(locked6Fiducials, fiducialsLocked);
+            this.templateSelectionValid = templateSelectionValid && questionCountMatches;
+            LinkedHashSet<String> reasons = new LinkedHashSet<>();
+            if (!geometryValid) reasons.add("INVALID_GEOMETRY");
+            if (!templateSelectionValid) reasons.add("UNSUPPORTED_TEMPLATE");
+            if (!questionCountMatches) reasons.add("QUESTION_COUNT_MISMATCH");
+            if (decodedStudentId == null || !decodedStudentId.matches("[0-9]{7}")) {
+                reasons.add("UNRESOLVED_STUDENT_ID");
+            }
+            for (QuestionResult question : questions) {
+                if (question.needsReview) reasons.add(question.reviewReason);
+            }
+            this.reviewReasons = Collections.unmodifiableList(new ArrayList<>(reasons));
+            this.needsReview = !reviewReasons.isEmpty();
             this.is10QForm = is10QForm;
-            this.locked6Fiducials = locked6Fiducials;
+            this.locked6Fiducials = geometryValid;
             this.fiducials = fiducials;
             this.fiducialsLocked = fiducialsLocked;
             this.processingMs = processingMs;
@@ -467,6 +500,75 @@ public class OmrNativeCvEngine {
         }
     }
 
+    private static final class SquareBlob extends Pt {
+        final int area;
+
+        SquareBlob(float x, float y, float fill, int area) {
+            super(x, y, fill);
+            this.area = area;
+        }
+    }
+
+    private static DetectedFiducials fromTriplets(VerticalTriplet<?> left, VerticalTriplet<?> right) {
+        DetectedFiducials fid = new DetectedFiducials();
+        fid.tl = left.top;
+        fid.ml = left.mid;
+        fid.bl = left.bot;
+        fid.tr = right.top;
+        fid.mr = right.mid;
+        fid.br = right.bot;
+        fid.locked6 = true;
+        fid.lockedCount = 6;
+        fid.confidence = (fid.tl.fill + fid.tr.fill + fid.ml.fill + fid.mr.fill + fid.bl.fill + fid.br.fill) / 6f;
+        fid.computeHomography();
+        return fid;
+    }
+
+    // Generated forms have six equally sized squares. Their axis-aligned bounding boxes
+    // become less full as the paper rotates. Verify the encoded strip before using this fit.
+    private static DetectedFiducials findPrintedFiducials(Iterable<SquareBlob> blobs) {
+        List<VerticalTriplet<SquareBlob>> sides = new ArrayList<>();
+        for (SquareBlob top : blobs) {
+            for (SquareBlob bottom : blobs) {
+                float height = bottom.y - top.y;
+                if (height < 240 || Math.abs(bottom.x - top.x) > height * 0.30f) continue;
+                if (Math.abs(top.area - bottom.area) > top.area * 0.35f) continue;
+                float midX = (bottom.x + top.x) * 0.5f;
+                float midY = (bottom.y + top.y) * 0.5f;
+                for (SquareBlob mid : blobs) {
+                    if (Math.abs(mid.area - top.area) <= top.area * 0.35f &&
+                            Math.abs(mid.x - midX) <= height * 0.025f &&
+                            Math.abs(mid.y - midY) <= height * 0.045f) {
+                        sides.add(new VerticalTriplet<>(top, mid, bottom));
+                    }
+                }
+            }
+        }
+        DetectedFiducials damaged = null;
+        float[] xy = new float[2];
+        for (VerticalTriplet<SquareBlob> left : sides) {
+            for (VerticalTriplet<SquareBlob> right : sides) {
+                float width = right.top.x - left.top.x;
+                float height = left.bot.y - left.top.y;
+                if (width < 200 || Math.abs(right.top.y - left.top.y) > width * 0.30f ||
+                        Math.abs((right.bot.x - left.bot.x) - width) > width * 0.12f ||
+                        Math.abs((right.bot.y - right.top.y) - height) > height * 0.12f) continue;
+                float scaleX = width / (CANON_TR_X - CANON_TL_X);
+                float scaleY = height / (CANON_BL_Y - CANON_TL_Y);
+                float side = 2f * CustomSheetLayout.MARKER_HALF_SIZE;
+                float expectedArea = side * side * scaleX * scaleY;
+                if (Math.abs(left.top.area - expectedArea) > expectedArea * 0.35f ||
+                        Math.abs(right.top.area - expectedArea) > expectedArea * 0.35f) continue;
+                DetectedFiducials candidate = fromTriplets(left, right);
+                int count = printedQuestionCount(candidate, scaleX, scaleY, xy);
+                if (count > 0) return candidate;
+                if (count < 0) damaged = candidate;
+            }
+        }
+        // A recognizable strip with a failed checksum must also go through the rejection path.
+        return damaged;
+    }
+
     private static DetectedFiducials detectSixPointFiducialsFast() {
         int stamp = ++sCurrentStamp;
         if (stamp == Integer.MAX_VALUE) {
@@ -476,6 +578,11 @@ public class OmrNativeCvEngine {
         }
 
         List<Pt> sqBlobs = new ArrayList<>(24);
+        // The six markers are larger than the code cells and filled answers. Bound the
+        // alternative search even on cluttered frames containing hundreds of components.
+        final int maxPrintedBlobs = 12;
+        PriorityQueue<SquareBlob> printedBlobs = new PriorityQueue<>(maxPrintedBlobs,
+            (a, b) -> Integer.compare(a.area, b.area));
         final int totalPx = CANONICAL_W * CANONICAL_H;
 
         for (int y = 9; y < CANONICAL_H - 9; y += 3) {
@@ -528,6 +635,11 @@ public class OmrNativeCvEngine {
                     if (area >= 45 && area <= 900 && bw >= 6 && bw <= 40 && bh >= 6 && bh <= 40) {
                         float fillRatio = (float) area / (float) (bw * bh);
                         float aspect = (float) bw / (float) bh;
+                        if (fillRatio >= 0.60f && aspect >= 0.65f && aspect <= 1.55f &&
+                                (printedBlobs.size() < maxPrintedBlobs || area > printedBlobs.element().area)) {
+                            if (printedBlobs.size() == maxPrintedBlobs) printedBlobs.remove();
+                            printedBlobs.add(new SquareBlob((float) sumX / area, (float) sumY / area, fillRatio, area));
+                        }
                         if (fillRatio >= 0.80f && aspect >= 0.42f && aspect <= 2.40f) {
                             sqBlobs.add(new Pt((float) sumX / area, (float) sumY / area, fillRatio));
                         }
@@ -536,7 +648,10 @@ public class OmrNativeCvEngine {
             }
         }
 
-        List<VerticalTriplet> triplets = new ArrayList<>(12);
+        DetectedFiducials printed = findPrintedFiducials(printedBlobs);
+        if (printed != null) return printed;
+
+        List<VerticalTriplet<Pt>> triplets = new ArrayList<>(12);
         int n = sqBlobs.size();
         for (int i = 0; i < n; i++) {
             Pt top = sqBlobs.get(i);
@@ -550,25 +665,24 @@ public class OmrNativeCvEngine {
                     if (k == i || k == j) continue;
                     Pt mid = sqBlobs.get(k);
                     if (Math.abs(mid.x - midX) < 18f && Math.abs(mid.y - midY) < 28f) {
-                        triplets.add(new VerticalTriplet(top, mid, bot));
+                        triplets.add(new VerticalTriplet<>(top, mid, bot));
                     }
                 }
             }
         }
 
         DetectedFiducials det = new DetectedFiducials();
-        VerticalTriplet bestL = null;
-        VerticalTriplet bestR = null;
+        VerticalTriplet<Pt> bestL = null;
+        VerticalTriplet<Pt> bestR = null;
         float bestScore = -999999f;
 
-        for (VerticalTriplet L : triplets) {
-            for (VerticalTriplet R : triplets) {
+        for (VerticalTriplet<Pt> L : triplets) {
+            for (VerticalTriplet<Pt> R : triplets) {
                 float spanX = R.avgX - L.avgX;
                 if (spanX > 160f &&
                     Math.abs(L.top.y - R.top.y) < 38f &&
                     Math.abs(L.mid.y - R.mid.y) < 38f &&
-                    Math.abs(L.bot.y - R.bot.y) < 38f &&
-                    (L.top.y > 120f || R.avgX < 480f)) {
+                    Math.abs(L.bot.y - R.bot.y) < 38f) {
                     float yDiff = Math.abs(L.top.y - R.top.y)
                                 + Math.abs(L.mid.y - R.mid.y)
                                 + Math.abs(L.bot.y - R.bot.y);
@@ -602,7 +716,6 @@ public class OmrNativeCvEngine {
                     if (u == i || u == j) continue;
                     Pt tr = sqBlobs.get(u);
                     if (tr.x - tl.x < 160f || Math.abs(tr.y - tl.y) > 48f) continue;
-                    if (!(tl.y > 120f || tr.x < 480f || tl.x < 52f || tr.x > 548f || tl.y < 54f)) continue;
                     for (int v = 0; v < n; v++) {
                         if (v == i || v == j || v == u) continue;
                         Pt br = sqBlobs.get(v);
@@ -633,18 +746,7 @@ public class OmrNativeCvEngine {
             : 0f;
 
         if (bestL != null && bestR != null && tripletArea >= cornerArea * 0.90f && (bestL.bot.y - bestL.top.y) >= 240f && (bestR.avgX - bestL.avgX) >= 200f) {
-            det.tl = bestL.top;
-            det.ml = bestL.mid;
-            det.bl = bestL.bot;
-            det.tr = bestR.top;
-            det.mr = bestR.mid;
-            det.br = bestR.bot;
-            det.locked6 = true;
-            det.lockedCount = 6;
-            det.confidence = (bestL.top.fill + bestL.mid.fill + bestL.bot.fill
-                            + bestR.top.fill + bestR.mid.fill + bestR.bot.fill) / 6f;
-            det.computeHomography();
-            return det;
+            return fromTriplets(bestL, bestR);
         }
 
         if (bestTL != null && bestTR != null && bestBL != null && bestBR != null) {
@@ -702,7 +804,7 @@ public class OmrNativeCvEngine {
         det.br = findCentroidNear(CANON_BR_X, CANON_BR_Y);
         det.locked6 = false;
         det.lockedCount = 0;
-        det.confidence = 0.65f;
+        det.confidence = 0f;
         det.computeHomography();
         return det;
     }
@@ -800,26 +902,23 @@ public class OmrNativeCvEngine {
         char[] masterKey,
         String templateMode
     ) {
+        if (srcW <= 0 || srcH <= 0 || nv21 == null || ((long) srcW * srcH) > nv21.length) {
+            throw new IllegalArgumentException("A complete camera luminance plane is required");
+        }
         long t0 = System.currentTimeMillis();
-        int maxIdx = nv21 != null ? nv21.length - 1 : -1;
         synchronized (ARENA_LOCK) {
-            if (maxIdx >= 0 && srcW > 0 && srcH > 0) {
-                for (int y = 0; y < CANONICAL_H; y++) {
-                    int rowOff = y * CANONICAL_W;
-                    for (int x = 0; x < CANONICAL_W; x++) {
-                        int sx, sy;
-                        if (rotate90Clockwise) {
-                            sx = (y * srcW) / CANONICAL_H;
-                            sy = srcH - 1 - ((x * srcH) / CANONICAL_W);
-                        } else {
-                            sx = (x * srcW) / CANONICAL_W;
-                            sy = (y * srcH) / CANONICAL_H;
-                        }
-                        sx = Math.max(0, Math.min(srcW - 1, sx));
-                        sy = Math.max(0, Math.min(srcH - 1, sy));
-                        int idx = Math.min(maxIdx, Math.max(0, sy * srcW + sx));
-                        sLuma[rowOff + x] = nv21[idx] & 0xFF;
+            for (int y = 0; y < CANONICAL_H; y++) {
+                int rowOff = y * CANONICAL_W;
+                for (int x = 0; x < CANONICAL_W; x++) {
+                    int sx, sy;
+                    if (rotate90Clockwise) {
+                        sx = (int) ((long) y * srcW / CANONICAL_H);
+                        sy = srcH - 1 - (int) ((long) x * srcH / CANONICAL_W);
+                    } else {
+                        sx = (int) ((long) x * srcW / CANONICAL_W);
+                        sy = (int) ((long) y * srcH / CANONICAL_H);
                     }
+                    sLuma[rowOff + x] = nv21[sy * srcW + sx] & 0xFF;
                 }
             }
             return executeCorePipelineLocked(null, questionCountOverride, masterKey, templateMode != null ? templateMode : "AUTO", t0);
@@ -868,6 +967,8 @@ public class OmrNativeCvEngine {
             return executeCorePipelineLocked(annotated, questionCountOverride, masterKey, presetHint, t0);
         }
     }
+
+    private static final float[][] CENTER_OFFSET = {{0f, 0f}};
 
     private static class ColSpec {
         final int startQ, endQ;
@@ -983,6 +1084,43 @@ public class OmrNativeCvEngine {
         )
     };
 
+    // Registered custom sheets carry their geometry version and count along the top marker band.
+    private static int printedQuestionCount(DetectedFiducials fid, float scaleX, float scaleY, float[] xy) {
+        if (!OmrDecisionRules.geometryValid(fid.locked6, fid.lockedCount)) return 0;
+        float[] densities = new float[CustomSheetLayout.CELL_COUNT];
+        for (int cell = 0; cell < densities.length; cell++) {
+            densities[cell] = sampleCanonicalCircleDirect(CustomSheetLayout.cellX(cell),
+                CustomSheetLayout.cellY(cell), CustomSheetLayout.CELL_SIZE * 0.30f, fid, scaleX, scaleY, xy);
+        }
+        return CustomSheetLayout.decode(densities);
+    }
+
+    private static TemplateSpec printedTemplate(int count) {
+        List<ColSpec> columns = new ArrayList<>(4);
+        for (int first = 1; first <= count;) {
+            float x = CustomSheetLayout.answerX(count, first, 0);
+            int last = first;
+            while (last < count && CustomSheetLayout.answerX(count, last + 1, 0) == x) last++;
+            float y = CustomSheetLayout.answerY(count, first);
+            float stepY = first == last ? 0f : CustomSheetLayout.answerY(count, first + 1) - y;
+            columns.add(new ColSpec(first, last, x, CustomSheetLayout.answerX(count, first, 1) - x,
+                y, stepY, CustomSheetLayout.ANSWER_RADIUS));
+            first = last + 1;
+        }
+        return new TemplateSpec(CustomSheetLayout.code(count), count, "Printed " + count + "Q",
+            columns.toArray(new ColSpec[0]), CustomSheetLayout.idX(0),
+            CustomSheetLayout.idX(1) - CustomSheetLayout.idX(0), CustomSheetLayout.idY(0),
+            CustomSheetLayout.idY(1) - CustomSheetLayout.idY(0), CustomSheetLayout.ID_RADIUS);
+    }
+
+    private static GradeOutcome rejectPrintedSheet(String message, DetectedFiducials fid,
+            Bitmap annotated, long startedAt) {
+        // No placeholder rows: a rejected registration cannot produce marks for an unrelated layout.
+        return new GradeOutcome(0, 0, 0, 0, 0, 0, "NO-ID", message, "", false, true, false,
+            fid.locked6, fid, fid.lockedCount, Math.max(1L, System.currentTimeMillis() - startedAt),
+            Collections.emptyList(), new float[0], new float[0], 0, "", annotated);
+    }
+
     private static float scoreTemplateCandidate(
         TemplateSpec t,
         DetectedFiducials fid,
@@ -1095,36 +1233,51 @@ public class OmrNativeCvEngine {
             }
         }
 
-        // Select best matching template across all 6 Sheet-X templates + 2 Camera templates
-        TemplateSpec bestTemplate = ALL_TEMPLATES[1]; // default Sheet-X 16Q
-        float bestScore = -9999f;
-
-        int targetFilterQ = 0;
-        if ("SHEETX_10Q".equals(presetHint) || "TPL_10Q_ID7".equals(presetHint) || "10Q".equals(presetHint)) targetFilterQ = 10;
-        else if ("SHEETX_16Q".equals(presetHint) || "TPL_16Q_ID7".equals(presetHint) || "16Q".equals(presetHint)) targetFilterQ = 16;
-        else if ("SHEETX_20Q".equals(presetHint) || "TPL_STD_20Q".equals(presetHint)) targetFilterQ = 20;
-        else if ("SHEETX_30Q".equals(presetHint) || "TPL_STD_30Q".equals(presetHint)) targetFilterQ = 30;
-        else if ("SHEETX_50Q".equals(presetHint) || "TPL_STD_50Q".equals(presetHint)) targetFilterQ = 50;
-        else if ("SHEETX_100Q".equals(presetHint) || "TPL_STD_100Q".equals(presetHint)) targetFilterQ = 100;
-        else if (questionCountOverride == 10 || questionCountOverride == 16 || questionCountOverride == 20 || questionCountOverride == 30 || questionCountOverride == 50 || questionCountOverride == 100) {
-            targetFilterQ = questionCountOverride;
+        int printedCount = printedQuestionCount(fid, scaleX, scaleY, tmpXY);
+        String requested = OmrDecisionRules.explicitTemplateCode(presetHint);
+        boolean requestedPrinted = requested != null && requested.startsWith("CUSTOM_V");
+        if (printedCount < 0 || (printedCount == 0 && requestedPrinted)) {
+            return rejectPrintedSheet("Count marker unreadable. Show the whole sheet and rescan.",
+                fid, annotated, t0);
         }
-
-        for (TemplateSpec t : ALL_TEMPLATES) {
-            if (targetFilterQ > 0 && t.qCount != targetFilterQ) continue;
-            float s = scoreTemplateCandidate(t, fid, scaleX, scaleY, tmpXY);
-            if (s > bestScore) {
-                bestScore = s;
-                bestTemplate = t;
+        boolean printed = printedCount > 0;
+        TemplateSpec bestTemplate = null;
+        if (printed) {
+            String code = CustomSheetLayout.code(printedCount);
+            if (requested != null && (!code.equals(requested) ||
+                    (questionCountOverride > 0 && questionCountOverride != printedCount))) {
+                return rejectPrintedSheet("Printed " + printedCount + "Q sheet does not match the selected layout.",
+                    fid, annotated, t0);
+            }
+            if (masterKey == null || masterKey.length < printedCount) {
+                return rejectPrintedSheet("Set a complete answer key for this " + printedCount + "Q sheet.",
+                    fid, annotated, t0);
+            }
+            bestTemplate = printedTemplate(printedCount);
+        } else {
+            // Papers from earlier releases lack a count marker. Keep their legacy preview path.
+            float bestScore = -Float.MAX_VALUE;
+            for (TemplateSpec candidate : ALL_TEMPLATES) {
+                if (!OmrDecisionRules.templateMatches(presetHint, candidate.code,
+                        candidate.qCount, questionCountOverride)) continue;
+                float score = scoreTemplateCandidate(candidate, fid, scaleX, scaleY, tmpXY);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestTemplate = candidate;
+                }
             }
         }
-
-        int effectiveQCount = questionCountOverride > 0
-            ? Math.min(bestTemplate.qCount, Math.max(1, questionCountOverride))
-            : bestTemplate.qCount;
+        boolean templateSelectionValid = bestTemplate != null;
+        if (!templateSelectionValid) bestTemplate = ALL_TEMPLATES[1];
+        boolean questionCountMatches = printed || questionCountOverride <= 0
+                || questionCountOverride == bestTemplate.qCount;
+        int effectiveQCount = !printed && questionCountOverride > 0
+            ? Math.min(bestTemplate.qCount, questionCountOverride) : bestTemplate.qCount;
 
         // Decode 7-Digit Student ID Grid via 2D Auto-Refined Grid + Peak-Snapped Projective Sampling
-        float[] idCal = refineIdGrid(
+        float[] idCal = printed
+            ? new float[]{bestTemplate.idBaseX, bestTemplate.idStepX, bestTemplate.idBaseY, bestTemplate.idStepY}
+            : refineIdGrid(
             bestTemplate.idBaseX,
             bestTemplate.idStepX,
             bestTemplate.idBaseY,
@@ -1141,7 +1294,7 @@ public class OmrNativeCvEngine {
         int idValidCount = 0;
 
         float idStepOff = Math.max(1.0f, bestTemplate.idR * 0.22f);
-        float[][] idPkOffsets = {
+        float[][] idPkOffsets = printed ? CENTER_OFFSET : new float[][] {
             {0f, 0f}, {-idStepOff, 0f}, {idStepOff, 0f}, {0f, -idStepOff}, {0f, idStepOff}
         };
 
@@ -1175,8 +1328,9 @@ public class OmrNativeCvEngine {
                     secondDensity = pkD;
                 }
             }
-            boolean validDigit = bestDensity >= 0.30f || (bestDensity >= 0.18f && (bestDensity - secondDensity) >= 0.07f);
-            sidBuilder.append(validDigit ? (char) ('0' + bestDig) : '?');
+            char decodedDigit = OmrDecisionRules.decodeIdDigit(bestDig, bestDensity, secondDensity);
+            boolean validDigit = decodedDigit != '?';
+            sidBuilder.append(decodedDigit);
 
             if (validDigit) {
                 mapCanonicalToSourceFast(bestCx, bestCy, fid, tmpXY);
@@ -1211,7 +1365,8 @@ public class OmrNativeCvEngine {
 
         for (ColSpec col : bestTemplate.cols) {
             int colRowCount = col.endQ - col.startQ + 1;
-            float[] cCal = refineColumnGrid(
+            float[] cCal = printed ? new float[]{col.baseX, col.stepX, col.baseY, col.stepY}
+                : refineColumnGrid(
                 col.baseX,
                 col.stepX,
                 col.baseY,
@@ -1225,7 +1380,7 @@ public class OmrNativeCvEngine {
             );
             float drawRadius = (col.r + 2.5f) * bubbleScale;
             float pkStep = Math.max(1.2f, col.r * 0.24f);
-            float[][] qPkOffsets = {
+            float[][] qPkOffsets = printed ? CENTER_OFFSET : new float[][] {
                 {0f, 0f}, {-pkStep, 0f}, {pkStep, 0f}, {0f, -pkStep}, {0f, pkStep}
             };
 
@@ -1237,10 +1392,6 @@ public class OmrNativeCvEngine {
                 float[] dVals = new float[4];
                 float[] optSrcX = new float[4];
                 float[] optSrcY = new float[4];
-                float maxD = 0f;
-                float secondMaxD = 0f;
-                float minD = 1f;
-                int bestIdx = 0;
 
                 for (int o = 0; o < 4; o++) {
                     float cx = cCal[0] + o * cCal[1];
@@ -1258,32 +1409,14 @@ public class OmrNativeCvEngine {
                     optSrcX[o] = tmpXY[0];
                     optSrcY[o] = tmpXY[1];
                     dVals[o] = pkD;
-                    if (pkD < minD) minD = pkD;
-                    if (pkD > maxD) {
-                        secondMaxD = maxD;
-                        maxD = pkD;
-                        bestIdx = o;
-                    } else if (pkD > secondMaxD) {
-                        secondMaxD = pkD;
-                    }
                 }
 
-                StringBuilder markedBuilder = new StringBuilder(3);
-                for (int o = 0; o < 4; o++) {
-                    if (dVals[o] >= 0.34f && (dVals[o] - minD) >= 0.14f && dVals[o] >= maxD * 0.58f) {
-                        if (markedBuilder.length() > 0) markedBuilder.append("+");
-                        markedBuilder.append(opts[o]);
-                    }
-                }
-                if (markedBuilder.length() == 0 && maxD >= 0.18f && (maxD - secondMaxD) >= 0.08f && maxD >= minD * 2.0f) {
-                    markedBuilder.append(opts[bestIdx]);
-                }
-
-                String markedStr = markedBuilder.toString();
+                OmrDecisionRules.MarkDecision decision = OmrDecisionRules.classifyMarks(dVals);
+                String markedStr = decision.markedOptions;
                 sigBuilder.append(markedStr.isEmpty() ? "-" : markedStr).append(",");
                 char keyChar = (q - 1 < masterKey.length) ? masterKey[q - 1] : 'A';
-                boolean isMulti = markedStr.contains("+");
-                boolean isBlank = markedStr.isEmpty();
+                boolean isMulti = decision.isMultipleMark;
+                boolean isBlank = decision.isBlank;
                 boolean isCorr = !isMulti && !isBlank && markedStr.charAt(0) == keyChar;
 
                 if (isCorr) correctCnt++;
@@ -1315,6 +1448,8 @@ public class OmrNativeCvEngine {
                     isCorr,
                     isMulti,
                     isBlank,
+                    decision.needsReview,
+                    decision.reviewReason,
                     dVals,
                     optSrcX,
                     optSrcY
@@ -1326,7 +1461,8 @@ public class OmrNativeCvEngine {
         long elapsed = Math.max(1L, System.currentTimeMillis() - t0);
         String sidStr = sidBuilder.toString();
         boolean hasStudentId = !"NO-ID".equals(sidStr);
-        String formName = bestTemplate.label;
+        String formName = templateSelectionValid && questionCountMatches
+                ? bestTemplate.label : "Unsupported template / question count";
         boolean is10QForm = "CAMERA_10Q".equals(bestTemplate.code);
 
         if (canvas != null) {
@@ -1345,7 +1481,7 @@ public class OmrNativeCvEngine {
             pBannerTxt.setTextSize(13.0f);
             pBannerTxt.setTypeface(Typeface.DEFAULT_BOLD);
             String idDisplay = hasStudentId ? ("ID: " + sidStr) : "No-ID Sheet";
-            String bannerLine = "✓ " + (fid.lockedCount > 0 ? fid.lockedCount : 4) + " Corners (" + elapsed + "ms) • " + formName + " • " + idDisplay + " • " + correctCnt + "/" + effectiveQCount + " (" + pct + "%)";
+            String bannerLine = (fid.lockedCount > 0 ? "✓ " : "Review: ") + fid.lockedCount + " Corners (" + elapsed + "ms) • " + formName + " • " + idDisplay + " • " + correctCnt + "/" + effectiveQCount + " (" + pct + "%)";
             canvas.drawText(bannerLine, 18f, 37f, pBannerTxt);
         }
 
@@ -1358,10 +1494,13 @@ public class OmrNativeCvEngine {
             pct,
             sidStr,
             formName,
+            templateSelectionValid ? bestTemplate.code : "",
+            templateSelectionValid,
+            questionCountMatches,
             is10QForm,
             fid.locked6,
             fid,
-            fid.lockedCount > 0 ? fid.lockedCount : 4,
+            fid.lockedCount,
             elapsed,
             results,
             idSrcX,

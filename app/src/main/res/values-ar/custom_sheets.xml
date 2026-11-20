@@ -1,0 +1,20 @@
+<resources>
+    <string name="create_sheet">إنشاء ورقة إجابة</string>
+    <string name="question_count">عدد الأسئلة</string>
+    <string name="count_instructions">اختر من ١ إلى ١٠٠ سؤال، بأربعة خيارات لكل سؤال على ورقة A4.</string>
+    <string name="create_pdf">إنشاء PDF</string>
+    <string name="invalid_count">أدخل عددًا من ١ إلى ١٠٠</string>
+    <string name="no_picker">تعذّر فتح نافذة حفظ الملفات.</string>
+    <string name="custom_pdf_saved">تم حفظ ورقة من %1$d سؤال. اطبعها على A4 بنسبة ١٠٠٪.</string>
+    <string name="pdf_write_failed">تعذّر حفظ الورقة. اختر مكانًا آخر.</string>
+    <string name="selected_printed">الورقة المحددة · %1$d سؤال</string>
+    <string name="auto_count_hint">يقرأ الوضع التلقائي عدد الأسئلة المطبوع على الورقة.</string>
+    <string name="read_printed_count">العدد المقروء · %1$d سؤال</string>
+    <string name="selected_legacy">شيت إكس · %1$d سؤال</string>
+    <string name="legacy_pdf">ورقة A4 القديمة</string>
+    <string name="review_key_for_count">راجع مفتاح الإجابة لعدد %1$d سؤال قبل حفظ الدرجة.</string>
+    <string name="use_answer_key">اعتماد مفتاح الإجابة</string>
+    <string name="unsupported_save">اختر الوضع التلقائي للورقة المنشأة أو حدد قالبها المطابق.</string>
+    <string name="count_unread">تعذّرت قراءة عدد الأسئلة</string>
+    <string name="align_count_strip">حاذِ الورقة مع إطار التصوير وأظهر شريط عدد الأسئلة كاملاً. إذا كانت الورقة بلا شريط، فاختر قالبها.</string>
+</resources>

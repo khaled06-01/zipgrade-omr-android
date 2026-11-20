@@ -1,0 +1,20 @@
+<resources>
+    <string name="create_sheet">Create answer sheet</string>
+    <string name="question_count">Number of questions</string>
+    <string name="count_instructions">Choose 1 to 100 questions for a four-choice A4 sheet.</string>
+    <string name="create_pdf">Create PDF</string>
+    <string name="invalid_count">Enter a number from 1 to 100</string>
+    <string name="no_picker">No document picker is available.</string>
+    <string name="custom_pdf_saved">Saved a %1$d-question sheet. Print on A4 at 100%%.</string>
+    <string name="pdf_write_failed">Could not save the sheet. Choose another destination.</string>
+    <string name="selected_printed">Selected sheet · %1$d questions</string>
+    <string name="auto_count_hint">Auto reads the question count printed on generated sheets.</string>
+    <string name="read_printed_count">Detected · %1$d questions</string>
+    <string name="selected_legacy">Sheet-X · %1$d questions</string>
+    <string name="legacy_pdf">Legacy A4 PDF</string>
+    <string name="review_key_for_count">Review the key for %1$d questions before saving a grade.</string>
+    <string name="use_answer_key">Use this answer key</string>
+    <string name="unsupported_save">Select Auto for a generated sheet, or its matching layout.</string>
+    <string name="count_unread">Question count unreadable</string>
+    <string name="align_count_strip">Level the page and show the full count strip. For a sheet without a strip, select its layout.</string>
+</resources>

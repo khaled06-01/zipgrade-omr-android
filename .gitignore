@@ -8,3 +8,10 @@
 /captures/
 .externalNativeBuild/
 .cxx/
+*.jks
+*.keystore
+/keystore/
+# Keep SDK paths, signing credentials, and local build tooling out of source control.
+keystore.properties
+signing.properties
+/.android/

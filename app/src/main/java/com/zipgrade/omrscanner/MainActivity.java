@@ -2,6 +2,7 @@ package com.zipgrade.omrscanner;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -35,12 +36,21 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -61,6 +71,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 @SuppressWarnings("deprecation")
 public class MainActivity extends Activity implements SurfaceHolder.Callback, Camera.PreviewCallback {
+    // Encode N in the result code so recreating this Activity cannot change the requested PDF.
+    private static final int REQ_CUSTOM_PDF_BASE = 2000;
+    private int approvedPrintedKeyCount;
+    private TextView sheetModeLabel;
+    private static final int REQ_EXPORT_10Q = 1010, REQ_EXPORT_16Q = 1016;
     private static final int REQ_CAMERA_CAPTURE = 1001;
     private static final int REQ_PICK_IMAGE = 1002;
     private static final int REQ_CAMERA_PERM_STREAM = 1003;
@@ -73,18 +88,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     private boolean hasCustomUserKey = false;
     private String currentPresetHint = "AUTO";
     private String selectedTemplateMode = "AUTO";
-    private String currentStudentName = "الفاتح الصادق (Student 1)";
+    private String currentStudentName = "";
     private Bitmap currentBitmap = null;
     private OmrNativeCvEngine.GradeOutcome lastOutcome = null;
 
     // Continuous Live Camera Stream State
     private boolean isStreamOpen = false;
     private boolean isStreamPaused = false;
-    private boolean autoSnapEnabled = true;
+    private boolean autoSnapEnabled = false;
+    private boolean isDemoImage;
     private boolean torchEnabled = false;
-    private int consecutiveLockedFrames = 0;
-    private int unlockedStreamFrames = 0;
-    private String lastAutoSavedSignature = "";
+    private final ScanCapturePolicy capturePolicy = new ScanCapturePolicy();
+    private final Set<String> savedCaptureSignatures = new HashSet<>();
+    private final Set<String> savedStudentContexts = new HashSet<>();
+    private final ExecutorService scanExecutor = Executors.newSingleThreadExecutor();
+    private int scanGeneration = 0;
     private long lastLiveUiUpdateMs = 0L;
     private Camera liveCamera = null;
     private int previewW = 0;
@@ -109,8 +127,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         public final int total;
         public final int percent;
         public final String time;
+        public final String evidence;
 
-        public SavedStudentGrade(String name, String studentId, int correct, int total, int percent, String time) {
+        public SavedStudentGrade(String name, String studentId, int correct, int total, int percent, String time, String evidence) {
+            this.evidence = evidence;
             this.name = name;
             this.studentId = studentId;
             this.correct = correct;
@@ -120,6 +140,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         }
     }
 
+    private boolean gradeStoreReadable = true;
     private final List<SavedStudentGrade> classList = new ArrayList<>();
     private final List<Button> templateButtons = new ArrayList<>();
     private final String[] templateCodes = new String[] {
@@ -251,9 +272,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             if (out != null && out.fiducials != null) {
                 OmrNativeCvEngine.DetectedFiducials f = out.fiducials;
                 boolean locked = out.locked6Fiducials;
+                String hold = gradingHoldReason(out);
                 Paint retPaint = locked ? pReticleLock : pReticleSearch;
 
-                if (locked) {
+                boolean readableLayout = hasReadableLayout(out);
+                if (locked && readableLayout) {
                     Path upper = new Path();
                     upper.moveTo(f.tl.x * sx, f.tl.y * sy);
                     upper.lineTo(f.tr.x * sx, f.tr.y * sy);
@@ -281,9 +304,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                             float bx = qr.optSrcX[o] * sx;
                             float by = qr.optSrcY[o] * sy;
                             if (isMarked) {
-                                Paint bp = qr.isCorrect ? pBubbleCorrect : (qr.isMultipleMark ? pBubbleMulti : pBubbleWrong);
+                                Paint bp = hold != null ? pBubbleId : (qr.isCorrect ? pBubbleCorrect : (qr.isMultipleMark ? pBubbleMulti : pBubbleWrong));
                                 canvas.drawCircle(bx, by, rad, bp);
-                            } else if (!qr.isCorrect && optChar == qr.correctOption) {
+                            } else if (hold == null && !qr.isCorrect && optChar == qr.correctOption) {
                                 canvas.drawCircle(bx, by, rad * 0.85f, pBubbleKeyHint);
                             }
                         }
@@ -308,13 +331,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
 
                 canvas.drawRoundRect(new RectF(dp(8), dp(8), vw - dp(8), dp(54)), dp(10), dp(10), pLabelBg);
                 boolean hasSid = out.decodedStudentId != null && !"NO-ID".equals(out.decodedStudentId) && !out.decodedStudentId.contains("?");
-                String sidDisp = hasSid ? ("ID: " + out.decodedStudentId) : ("No-ID (Paper #" + (classList.size() + 1) + ")");
-                String line1 = locked
+                String sidDisp = hasSid ? ("ID: " + out.decodedStudentId) : "Check student ID";
+                String line1 = !readableLayout && "AUTO".equals(selectedTemplateMode)
+                    ? getString(R.string.count_unread) : locked
                     ? ("✓ PAPER LOCKED (" + out.processingMs + "ms) • " + out.detectedFormName)
                     : ("📹 Live Stream (" + out.processingMs + "ms/frame) • Align 4 or 6 Corner Squares");
-                String line2 = locked
-                    ? ("Score: " + out.correctCount + "/" + out.totalQuestions + " (" + out.scorePercent + "%)  •  " + sidDisp + (isStreamPaused ? "  [PAUSED]" : "  [LIVE]"))
-                    : ("Works with or without Student ID — point at any exam paper to grade live");
+                String line2 = hold != null ? hold : locked
+                    ? (out.needsReview ? reviewMessage(out) : "Score: " + out.correctCount + "/" + out.totalQuestions + " (" + out.scorePercent + "%)  •  " + sidDisp + (isStreamPaused ? "  [PAUSED]" : "  [LIVE]"))
+                    : ("Show all sheet markers");
                 canvas.drawText(line1, dp(15), dp(26), pLabelTxt);
                 canvas.drawText(line2, dp(15), dp(45), pScoreSubTxt);
             }
@@ -326,21 +350,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         super.onCreate(savedInstanceState);
         try {
             loadSavedState();
-        } catch (Throwable ignored) {}
-        buildTeacherUi();
-        try {
-            loadAssetSample("sheetx_16q.jpg", 16, "SHEETX_16Q", "الفاتح الصادق (Sheet-X 16Q)");
-        } catch (Throwable t) {
-            try {
-                loadAssetSample("sheet_16q.jpg", 16, "16Q", "الفاتح الصادق (Form 6353B)");
-            } catch (Throwable ignored) {}
+        } catch (RuntimeException e) {
+            gradeStoreReadable = false;
+            Toast.makeText(this, "Could not read saved settings. Existing data is protected.", Toast.LENGTH_LONG).show();
         }
+        buildTeacherUi();
+        // Samples remain available explicitly; startup must not change a saved key or quiz size.
     }
 
     @Override
     protected void onPause() {
         super.onPause();
         stopLiveCameraStream();
+    }
+
+    @Override
+    protected void onDestroy() {
+        scanExecutor.shutdownNow();
+        super.onDestroy();
+    }
+
+    private void invalidatePendingScan() {
+        scanGeneration++;
+        capturePolicy.reset();
     }
 
     private int dp(int v) {
@@ -360,13 +392,37 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
 
     private void loadSavedState() {
         SharedPreferences sp = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        activeQuestionCount = sp.getInt("q_count", 16);
+        approvedPrintedKeyCount = sp.getInt("approved_printed_key_count", 0);
+        activeQuestionCount = Math.max(1, Math.min(100, sp.getInt("q_count", 16)));
         String savedKey = sp.getString("master_key_50", null);
+        hasCustomUserKey = ScanCapturePolicy.restoreCustomKeyFlag(savedKey != null,
+            sp.contains("has_custom_key") ? sp.getBoolean("has_custom_key", false) : null);
+        selectedTemplateMode = sp.getString("template_mode", "AUTO");
+        currentPresetHint = selectedTemplateMode;
+        savedCaptureSignatures.clear();
+        savedCaptureSignatures.addAll(sp.getStringSet("saved_capture_signatures", new HashSet<String>()));
+        savedStudentContexts.clear();
+        savedStudentContexts.addAll(sp.getStringSet("saved_student_contexts", new HashSet<String>()));
         if (savedKey != null) {
             int len = Math.min(savedKey.length(), masterKey.length);
             for (int i = 0; i < len; i++) {
                 masterKey[i] = savedKey.charAt(i);
             }
+        }
+        if (sp.contains("class_grades_v3")) {
+            try {
+                JSONArray rows = new JSONArray(sp.getString("class_grades_v3", "[]"));
+                for (int i = 0; i < rows.length(); i++) {
+                    JSONObject row = rows.getJSONObject(i);
+                    classList.add(new SavedStudentGrade(row.getString("name"), row.getString("id"),
+                        row.getInt("correct"), row.getInt("total"), row.getInt("percent"),
+                        row.getString("time"), row.optString("evidence", "")));
+                }
+            } catch (JSONException e) {
+                gradeStoreReadable = false;
+                Toast.makeText(this, "Could not load the gradebook. Saving is disabled to protect your records.", Toast.LENGTH_LONG).show();
+            }
+            return;
         }
         String savedGrades = sp.getString("class_grades_v2", "");
         classList.clear();
@@ -382,39 +438,42 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                             Integer.parseInt(parts[2]),
                             Integer.parseInt(parts[3]),
                             Integer.parseInt(parts[4]),
-                            parts[5]
+                            parts[5], ""
                         ));
                     } catch (Exception ignored) {}
                 }
             }
         }
-        if (classList.isEmpty()) {
-            classList.add(new SavedStudentGrade("الفاتح الصادق", "4633166", 15, 16, 94, "09:15"));
-            classList.add(new SavedStudentGrade("محمد القرني", "4611706", 10, 10, 100, "09:12"));
-        }
     }
 
-    private void persistState() {
+    private boolean persistState() {
         SharedPreferences sp = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        StringBuilder sb = new StringBuilder();
-        for (SavedStudentGrade g : classList) {
-            if (sb.length() > 0) sb.append("\n");
-            sb.append(g.name.replace("|", " ")).append("|")
-              .append(g.studentId).append("|")
-              .append(g.correct).append("|")
-              .append(g.total).append("|")
-              .append(g.percent).append("|")
-              .append(g.time);
+        if (!gradeStoreReadable) return false;
+        JSONArray rows = new JSONArray();
+        try {
+            for (SavedStudentGrade g : classList) {
+                rows.put(new JSONObject().put("name", g.name).put("id", g.studentId)
+                    .put("correct", g.correct).put("total", g.total).put("percent", g.percent)
+                    .put("time", g.time).put("evidence", g.evidence));
+            }
+        } catch (JSONException e) {
+            return false;
         }
-        sp.edit()
+        return sp.edit()
           .putInt("q_count", activeQuestionCount)
+          .putInt("approved_printed_key_count", approvedPrintedKeyCount)
           .putString("master_key_50", new String(masterKey))
-          .putString("class_grades_v2", sb.toString())
-          .apply();
+          .putBoolean("has_custom_key", hasCustomUserKey)
+          .putString("template_mode", selectedTemplateMode)
+          .putStringSet("saved_capture_signatures", new HashSet<>(savedCaptureSignatures))
+          .putStringSet("saved_student_contexts", new HashSet<>(savedStudentContexts))
+          .putString("class_grades_v3", rows.toString())
+          .commit();
     }
 
     private void buildTeacherUi() {
         LinearLayout root = new LinearLayout(this);
+        root.setFitsSystemWindows(true);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.parseColor("#0F172A"));
 
@@ -432,7 +491,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         header.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("v2.3 Continuous Live Stream (~5.5ms OMR) • Non-Stop Grading + 7 Templates");
+        subtitle.setText("Scan a sheet or import a photo • مسح ورقة الإجابة");
         subtitle.setTextColor(Color.parseColor("#34D399"));
         subtitle.setTextSize(11.5f);
         subtitle.setPadding(0, dp(3), 0, 0);
@@ -612,7 +671,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         snapNowBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                snapshotCurrentStreamFrameKeepStreaming("📸 Saved Student Grade! Point at next paper...");
+                snapshotCurrentStreamFrameKeepStreaming(true);
             }
         });
 
@@ -620,6 +679,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         pauseStreamBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                invalidatePendingScan();
                 isStreamPaused = !isStreamPaused;
                 pauseStreamBtn.setText(isStreamPaused ? "▶ Resume" : "⏸ Freeze");
                 pauseStreamBtn.setBackground(roundedBox(
@@ -629,7 +689,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                 ));
                 pauseStreamBtn.setTextColor(isStreamPaused ? Color.WHITE : Color.parseColor("#38BDF8"));
                 if (isStreamPaused) {
-                    snapshotCurrentStreamFrameKeepStreaming("⏸ Stream Frozen on Current Paper");
+                    snapshotCurrentStreamFrameKeepStreaming(false);
                 }
                 if (liveArHudView != null) liveArHudView.invalidate();
             }
@@ -652,15 +712,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         streamControlsRow.addView(torchToggleBtn, new LinearLayout.LayoutParams(0, dp(42), 0.45f));
 
         liveStreamCard.addView(streamControlsRow);
+        autoSnapToggleBtn = createActionBtn("Auto-save: off", "#1E293B", "#FFFFFF");
+        autoSnapToggleBtn.setOnClickListener(v -> {
+            autoSnapEnabled = !autoSnapEnabled;
+            capturePolicy.reset();
+            autoSnapToggleBtn.setText(autoSnapEnabled ? "Auto-save: on" : "Auto-save: off");
+        });
+        liveStreamCard.addView(autoSnapToggleBtn);
         sourceCard.addView(liveStreamCard, lscLp);
 
-        // Single Unified Exam Size & Template Row (Supports all 6 Sheet-X Templates: 10Q, 16Q, 20Q, 30Q, 50Q, 100Q)
-        TextView tplTitle = new TextView(this);
-        tplTitle.setText("Sheet-X Templates (6) • قوالب شيت إكس (10Q / 16Q / 20Q / 30Q / 50Q / 100Q):");
-        tplTitle.setTextColor(Color.parseColor("#94A3B8"));
-        tplTitle.setTextSize(11.5f);
-        tplTitle.setPadding(0, dp(6), 0, dp(4));
-        sourceCard.addView(tplTitle);
+        Button createSheet = createActionBtn(getString(R.string.create_sheet), "#065F46", "#FFFFFF");
+        createSheet.setOnClickListener(v -> chooseCustomCount());
+        sourceCard.addView(createSheet, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
+        sheetModeLabel = new TextView(this);
+        sheetModeLabel.setTextColor(Color.parseColor("#F1F5F9"));
+        sheetModeLabel.setPadding(0, dp(6), 0, dp(4));
+        updateSheetModeLabel();
+        sourceCard.addView(sheetModeLabel);
 
         HorizontalScrollView tplScroll = new HorizontalScrollView(this);
         LinearLayout tplRow = new LinearLayout(this);
@@ -681,53 +749,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         for (int i = 0; i < templateCodes.length; i++) {
             final String code = templateCodes[i];
             final int defQ = tplDefaultQ[i];
-            Button tb = createActionBtn(tplLabels[i], i == 0 ? "#065F46" : "#0F172A", i == 0 ? "#A7F3D0" : "#E2E8F0");
+            Button tb = createActionBtn(tplLabels[i], selectedTemplateMode.equals(code) ? "#065F46" : "#0F172A", selectedTemplateMode.equals(code) ? "#A7F3D0" : "#E2E8F0");
             LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36));
             tlp.setMargins(0, 0, dp(6), 0);
             tb.setPadding(dp(12), 0, dp(12), 0);
             tb.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
-                    if (defQ > 0) {
-                        setMasterKeyPreset16Q();
-                        selectTemplateMode(code, defQ, false);
-                        if (!isStreamOpen) {
-                            loadAssetSample(
-                                "sheetx_" + defQ + "q.jpg",
-                                defQ,
-                                code,
-                                "الفاتح الصادق (Sheet-X " + defQ + "Q)"
-                            );
-                        }
-                    } else {
-                        selectTemplateMode("AUTO", 0, true);
-                    }
+                    selectTemplateMode(code, defQ, false);
                 }
             });
             templateButtons.add(tb);
             tplRow.addView(tb, tlp);
         }
 
-        Button minusBtn = createActionBtn("-1", "#334155", "#FFFFFF");
-        minusBtn.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                updateQuestionCount(Math.max(1, activeQuestionCount - 1));
-            }
+        Button sampleBtn = createActionBtn("Example sheet", "#334155", "#FFFFFF");
+        sampleBtn.setOnClickListener(v -> {
+            if (isStreamOpen) stopLiveCameraStream();
+            int count = selectedTemplateMode.startsWith("SHEETX_") ? activeQuestionCount : 16;
+            selectTemplateMode("SHEETX_" + count + "Q", count, false);
+            loadAssetSample("sheetx_" + count + "q.jpg", count, selectedTemplateMode, "Example");
         });
-        tplRow.addView(minusBtn, new LinearLayout.LayoutParams(dp(44), dp(36)));
-
-        View spm = new View(this);
-        tplRow.addView(spm, new LinearLayout.LayoutParams(dp(5), dp(1)));
-
-        Button plusBtn = createActionBtn("+1", "#334155", "#FFFFFF");
-        plusBtn.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                updateQuestionCount(Math.min(100, activeQuestionCount + 1));
-            }
-        });
-        tplRow.addView(plusBtn, new LinearLayout.LayoutParams(dp(44), dp(36)));
+        tplRow.addView(sampleBtn);
+        Button pdfBtn = createActionBtn(getString(R.string.legacy_pdf), "#334155", "#FFFFFF");
+        pdfBtn.setOnClickListener(v -> exportBlankSheet());
+        tplRow.addView(pdfBtn);
 
         tplScroll.addView(tplRow);
         sourceCard.addView(tplScroll);
@@ -747,7 +793,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         topScoreRow.setGravity(Gravity.CENTER_VERTICAL);
 
         scorePercentText = new TextView(this);
-        scorePercentText.setText("94%");
+        scorePercentText.setText("—");
         scorePercentText.setTextColor(Color.parseColor("#34D399"));
         scorePercentText.setTextSize(30f);
         scorePercentText.setTypeface(Typeface.DEFAULT_BOLD);
@@ -758,20 +804,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         rightMeta.setPadding(dp(14), 0, 0, 0);
 
         scoreFractionText = new TextView(this);
-        scoreFractionText.setText("Score: 15 / 16 Correct");
+        scoreFractionText.setText("Scan or import a sheet");
         scoreFractionText.setTextColor(Color.WHITE);
         scoreFractionText.setTextSize(15f);
         scoreFractionText.setTypeface(Typeface.DEFAULT_BOLD);
         rightMeta.addView(scoreFractionText);
 
         gradeBadgeText = new TextView(this);
-        gradeBadgeText.setText("Grade: Excellent • ممتاز");
+        gradeBadgeText.setText("");
         gradeBadgeText.setTextColor(Color.parseColor("#A7F3D0"));
         gradeBadgeText.setTextSize(12.5f);
         rightMeta.addView(gradeBadgeText);
 
         studentIdText = new TextView(this);
-        studentIdText.setText("Student ID: 4633166");
+        studentIdText.setText("");
         studentIdText.setTextColor(Color.parseColor("#7DD3FC"));
         studentIdText.setTextSize(12f);
         rightMeta.addView(studentIdText);
@@ -812,7 +858,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             }
         });
 
-        Button saveStudentBtn = createActionBtn("✓ Save Student Grade", "#10B981", "#020617");
+        Button saveStudentBtn = createActionBtn("Review / save grade", "#10B981", "#020617");
         saveStudentBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -896,12 +942,74 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         return sv;
     }
 
+    private void updateSheetModeLabel() {
+        int count = CustomSheetLayout.parseCode(selectedTemplateMode);
+        if (count > 0) sheetModeLabel.setText(getString(R.string.selected_printed, count));
+        else if ("AUTO".equals(selectedTemplateMode)) sheetModeLabel.setText(R.string.auto_count_hint);
+        else sheetModeLabel.setText(getString(R.string.selected_legacy, activeQuestionCount));
+    }
+
+    private void chooseCustomCount() {
+        EditText field = new EditText(this);
+        field.setSingleLine();
+        field.setKeyListener(android.text.method.DigitsKeyListener.getInstance("0123456789٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹"));
+        field.setRawInputType(InputType.TYPE_CLASS_NUMBER);
+        field.setText(String.valueOf(activeQuestionCount));
+        field.selectAll();
+        field.setContentDescription(getString(R.string.question_count));
+        LinearLayout inset = new LinearLayout(this);
+        inset.setPadding(dp(22), dp(8), dp(22), 0);
+        inset.addView(field, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)));
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setTitle(R.string.question_count).setMessage(R.string.count_instructions).setView(inset)
+            .setNegativeButton(android.R.string.cancel, null).setPositiveButton(R.string.create_pdf, null).create();
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            int count;
+            try {
+                count = Integer.parseInt(field.getText().toString().trim());
+            } catch (NumberFormatException e) {
+                count = 0;
+            }
+            if (!CustomSheetLayout.validCount(count)) {
+                field.setError(getString(R.string.invalid_count));
+                return;
+            }
+            Intent file = new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/pdf").putExtra(Intent.EXTRA_TITLE, "Answer-sheet-" + count + "Q.pdf");
+            try {
+                startActivityForResult(file, REQ_CUSTOM_PDF_BASE + count);
+                dialog.dismiss();
+            } catch (android.content.ActivityNotFoundException e) {
+                Toast.makeText(this, R.string.no_picker, Toast.LENGTH_LONG).show();
+            }
+        }));
+        dialog.show();
+    }
+
+    private void exportBlankSheet() {
+        if (!ScanCapturePolicy.isPilotLayout(selectedTemplateMode, selectedTemplateMode)) {
+            Toast.makeText(this, "Select 10Q or 16Q for a blank A4 sheet", Toast.LENGTH_LONG).show();
+            return;
+        }
+        boolean ten = "SHEETX_10Q".equals(selectedTemplateMode);
+        Intent document = new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("application/pdf").putExtra(Intent.EXTRA_TITLE, ten ? "Sheet-X-10Q.pdf" : "Sheet-X-16Q.pdf");
+        try {
+            startActivityForResult(document, ten ? REQ_EXPORT_10Q : REQ_EXPORT_16Q);
+        } catch (android.content.ActivityNotFoundException e) {
+            Toast.makeText(this, "No document picker is available", Toast.LENGTH_LONG).show();
+        }
+    }
+
     private void selectTemplateMode(String code, int defaultQ, boolean showToast) {
+        invalidatePendingScan();
+        lastOutcome = latestStreamOutcome = null;
+        latestNv21Frame = null;
         selectedTemplateMode = code;
         currentPresetHint = code;
         if (defaultQ > 0) {
             activeQuestionCount = defaultQ;
-            if (!hasCustomUserKey) {
+            if (!hasCustomUserKey && CustomSheetLayout.parseCode(code) == 0) {
                 if (defaultQ == 10) setMasterKeyPreset10Q();
                 else if (defaultQ == 16) setMasterKeyPreset16Q();
             }
@@ -912,6 +1020,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             b.setBackground(roundedBox(active ? "#065F46" : "#0F172A", active ? "#10B981" : "#475569", 10));
             b.setTextColor(Color.parseColor(active ? "#A7F3D0" : "#E2E8F0"));
         }
+        updateSheetModeLabel();
+        tabBtnKey.setText("2. Key (" + activeQuestionCount + "Q)");
+        persistState();
         runOmrPipeline();
         if (showToast) {
             Toast.makeText(this, "Template set to " + code + " (" + activeQuestionCount + "Q)", Toast.LENGTH_SHORT).show();
@@ -935,7 +1046,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     private void openLiveCameraStream() {
         isStreamOpen = true;
         isStreamPaused = false;
-        consecutiveLockedFrames = 0;
+        invalidatePendingScan();
+        lastOutcome = null;
+        currentBitmap = null;
+        isDemoImage = false;
+        studentNameInput.setText("");
         liveStreamCard.setVisibility(View.VISIBLE);
         streamToggleBtn.setText("⏹ Stop Stream");
         streamToggleBtn.setBackground(roundedBox("#EF4444", "#B91C1C", 10));
@@ -1027,6 +1142,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     }
 
     private void releaseCameraHardware() {
+        invalidatePendingScan();
+        latestNv21Frame = null;
+        latestStreamOutcome = null;
         if (liveCamera != null) {
             try {
                 liveCamera.setPreviewCallback(null);
@@ -1065,135 +1183,117 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
 
     @Override
     public void onPreviewFrame(final byte[] data, Camera camera) {
-        if (!isStreamOpen || isStreamPaused || data == null || previewW <= 0 || previewH <= 0) return;
-        latestNv21Frame = data;
-
-        if (!isProcessingStreamFrame.compareAndSet(false, true)) {
-            return;
-        }
-
-        final int w = previewW;
-        final int h = previewH;
-        final int qOverride = "AUTO".equals(selectedTemplateMode) ? (hasCustomUserKey ? activeQuestionCount : 0) : activeQuestionCount;
-        final String tplMode = selectedTemplateMode;
-
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    final OmrNativeCvEngine.GradeOutcome streamOut = OmrNativeCvEngine.analyzeNv21StreamFrame(
-                        data,
-                        w,
-                        h,
-                        true,
-                        qOverride,
-                        masterKey,
-                        tplMode
-                    );
-                    latestStreamOutcome = streamOut;
-
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            if (!isStreamOpen) return;
-                            if (streamOut.locked6Fiducials) {
-                                consecutiveLockedFrames++;
-                                unlockedStreamFrames = 0;
-                                boolean hasValidId = streamOut.decodedStudentId != null
-                                    && !"NO-ID".equals(streamOut.decodedStudentId)
-                                    && !streamOut.decodedStudentId.contains("?");
-                                String idTag = hasValidId
-                                    ? ("ID: " + streamOut.decodedStudentId)
-                                    : ("Paper #" + (classList.size() + 1) + " (No-ID)");
-                                streamStatusBanner.setText(
-                                    "🟢 LIVE GRADED: " + streamOut.correctCount + "/" + streamOut.totalQuestions
-                                    + " (" + streamOut.scorePercent + "%) • " + idTag
-                                    + " • " + streamOut.processingMs + "ms (Stream continues non-stop!)"
-                                );
-
-                                // Continuously update the Live Score Card & Question Breakdown without stopping stream!
-                                long now = System.currentTimeMillis();
-                                if (now - lastLiveUiUpdateMs >= 280L) {
-                                    lastLiveUiUpdateMs = now;
-                                    applyOutcomeToScoreUi(streamOut, false);
-                                }
-
-                                // On 3rd consecutive locked frame, update annotated preview & auto-save if new paper
-                                if (consecutiveLockedFrames == 3) {
-                                    Bitmap snapBmp = OmrNativeCvEngine.nv21ToPortraitBitmap(data, w, h, true);
-                                    currentBitmap = snapBmp;
-                                    OmrNativeCvEngine.GradeOutcome fullOut = OmrNativeCvEngine.gradeSheetBitmap(
-                                        snapBmp,
-                                        qOverride,
-                                        masterKey,
-                                        tplMode
-                                    );
-                                    applyOutcomeToScoreUi(fullOut, true);
-
-                                    if (autoSnapEnabled && !streamOut.answerSignature.equals(lastAutoSavedSignature)) {
-                                        lastAutoSavedSignature = streamOut.answerSignature;
-                                        int nextPaperNum = classList.size() + 1;
-                                        String autoName = hasValidId
-                                            ? ("Student #" + streamOut.decodedStudentId)
-                                            : ("Paper #" + nextPaperNum + " • ورقة " + nextPaperNum);
-                                        studentNameInput.setText(autoName);
-                                        saveCurrentStudentToClassList();
-                                    }
-                                }
-                            } else {
-                                consecutiveLockedFrames = 0;
-                                unlockedStreamFrames++;
-                                // If the paper was removed from the camera for >= 3 frames, clear signature so even an identical No-ID paper can be graded next!
-                                if (unlockedStreamFrames >= 3) {
-                                    lastAutoSavedSignature = "";
-                                }
-                                streamStatusBanner.setText(
-                                    "📹 Continuous Stream (" + streamOut.processingMs + "ms/frame) • Point at next paper to grade live"
-                                );
-                            }
-                            if (liveArHudView != null) {
-                                liveArHudView.invalidate();
-                            }
+        if (camera != liveCamera || !isStreamOpen || isStreamPaused || data == null || previewW <= 0 || previewH <= 0) return;
+        if (!isProcessingStreamFrame.compareAndSet(false, true)) return;
+        final byte[] frame = data.clone();
+        final int width = previewW, height = previewH, generation = scanGeneration;
+        final String mode = selectedTemplateMode;
+        final int count = "AUTO".equals(mode) && !hasCustomUserKey ? 0 : activeQuestionCount;
+        final char[] key = masterKey.clone();
+        scanExecutor.execute(() -> {
+            try {
+                final OmrNativeCvEngine.GradeOutcome out = OmrNativeCvEngine.analyzeNv21StreamFrame(
+                    frame, width, height, true, count, key, mode);
+                runOnUiThread(() -> {
+                    try {
+                        if (generation != scanGeneration || !isStreamOpen || isStreamPaused) return;
+                        latestNv21Frame = frame;
+                        latestStreamOutcome = out;
+                        lastOutcome = out;
+                        String hold = gradingHoldReason(out);
+                        boolean eligible = hold == null && !out.needsReview;
+                        String signature = eligible ? captureSignature(out, key) : "";
+                        boolean stable = capturePolicy.observe(signature, eligible);
+                        streamStatusBanner.setText(hold != null ? hold : out.needsReview ? reviewMessage(out)
+                            : (stable ? "Stable reading" : "Hold steady") + " • ID " + out.decodedStudentId);
+                        long now = android.os.SystemClock.elapsedRealtime();
+                        if (now - lastLiveUiUpdateMs >= 280) {
+                            lastLiveUiUpdateMs = now;
+                            applyOutcomeToScoreUi(out, false);
                         }
-                    });
-                } catch (Exception ignored) {
-                } finally {
+                        if (autoSnapEnabled && stable && ScanCapturePolicy.canSaveLayout(mode, out.detectedTemplateCode) && !savedCaptureSignatures.contains(signature)) {
+                            saveOutcome(out, true);
+                        }
+                        liveArHudView.invalidate();
+                    } finally {
+                        isProcessingStreamFrame.set(false);
+                    }
+                });
+            } catch (RuntimeException ex) {
+                runOnUiThread(() -> {
+                    if (generation == scanGeneration) {
+                        capturePolicy.reset();
+                        latestNv21Frame = null;
+                        latestStreamOutcome = lastOutcome = null;
+                        streamStatusBanner.setText("Could not read the frame. Reposition the sheet.");
+                    }
                     isProcessingStreamFrame.set(false);
-                }
+                });
             }
-        }).start();
+        });
     }
 
-    /**
-     * Snapshots and grades the current live camera stream frame WITHOUT stopping the live stream!
-     */
-    private void snapshotCurrentStreamFrameKeepStreaming(String toastMsg) {
-        if (latestNv21Frame != null && previewW > 0 && previewH > 0) {
-            Bitmap captured = OmrNativeCvEngine.nv21ToPortraitBitmap(latestNv21Frame, previewW, previewH, true);
-            currentBitmap = captured;
-            runOmrPipeline();
-            saveCurrentStudentToClassList();
-            Toast.makeText(this, toastMsg, Toast.LENGTH_SHORT).show();
+    private static String captureSignature(OmrNativeCvEngine.GradeOutcome out, char[] key) {
+        return ScanCapturePolicy.context(out.detectedTemplateCode, out.totalQuestions, key, out.decodedStudentId)
+            + "|" + out.answerSignature;
+    }
+
+    private boolean hasReadableLayout(OmrNativeCvEngine.GradeOutcome out) {
+        if (!out.geometryValid || !out.templateSelectionValid || out.totalQuestions <= 0) return false;
+        return !"AUTO".equals(selectedTemplateMode)
+            || CustomSheetLayout.parseCode(out.detectedTemplateCode) == out.totalQuestions;
+    }
+
+    private String gradingHoldReason(OmrNativeCvEngine.GradeOutcome out) {
+        if (!hasReadableLayout(out)) return reviewMessage(out);
+        if (CustomSheetLayout.parseCode(out.detectedTemplateCode) > 0 && approvedPrintedKeyCount != out.totalQuestions)
+            return getString(R.string.review_key_for_count, out.totalQuestions);
+        return null;
+    }
+
+    private String reviewMessage(OmrNativeCvEngine.GradeOutcome out) {
+        if ("AUTO".equals(selectedTemplateMode) && !hasReadableLayout(out)) return getString(R.string.align_count_strip);
+        if (out.totalQuestions == 0 && !out.templateSelectionValid) return out.detectedFormName;
+        if (!out.geometryValid) return "Align the sheet markers and scan again";
+        if (!out.templateSelectionValid) return "Check the selected sheet layout";
+        if (!ScanCapturePolicy.hasCompleteStudentId(out.decodedStudentId)) return "Check the seven student ID columns";
+        for (OmrNativeCvEngine.QuestionResult row : out.questions) {
+            if (row.needsReview) return "Review question " + row.questionNumber + " • " + row.reviewReason.replace('_', ' ').toLowerCase(Locale.ROOT);
         }
+        return "Review the sheet";
+    }
+
+    private void snapshotCurrentStreamFrameKeepStreaming(boolean save) {
+        if (latestNv21Frame == null || latestStreamOutcome == null) return;
+        // Use the same analysed frame for the preview and the save.
+        currentBitmap = OmrNativeCvEngine.nv21ToPortraitBitmap(latestNv21Frame, previewW, previewH, true);
+        sheetImageView.setImageBitmap(currentBitmap);
+        applyOutcomeToScoreUi(latestStreamOutcome, false);
+        if (save) saveOutcome(latestStreamOutcome, false);
     }
 
     private void applyOutcomeToScoreUi(OmrNativeCvEngine.GradeOutcome outcome, boolean updateImage) {
         lastOutcome = outcome;
-        activeQuestionCount = outcome.totalQuestions;
-        scorePercentText.setText(outcome.scorePercent + "%");
-        scoreFractionText.setText("Score: " + outcome.correctCount + " / " + outcome.totalQuestions + " Correct (" + outcome.processingMs + "ms)");
-        gradeBadgeText.setText("Grade: " + getGradeWord(outcome.scorePercent) + "  •  " + outcome.detectedFormName);
-        boolean hasValidId = outcome.decodedStudentId != null
-            && !"NO-ID".equals(outcome.decodedStudentId)
-            && !outcome.decodedStudentId.contains("?");
-        String idLabel = hasValidId
-            ? ("Student ID: " + outcome.decodedStudentId)
-            : ("Student ID: None (Auto Paper #" + (classList.size() + 1) + " • بدون رقم)");
-        studentIdText.setText(
-            idLabel + "   •   Mistakes: " + (outcome.wrongCount + outcome.multipleMarkCount)
-        );
-        if (updateImage && outcome.annotatedBitmap != null) {
-            sheetImageView.setImageBitmap(outcome.annotatedBitmap);
+        boolean readableLayout = hasReadableLayout(outcome);
+        if ("AUTO".equals(selectedTemplateMode) && readableLayout) {
+            activeQuestionCount = outcome.totalQuestions;
+        }
+        if (readableLayout && CustomSheetLayout.parseCode(outcome.detectedTemplateCode) > 0)
+            sheetModeLabel.setText(getString(R.string.read_printed_count, outcome.totalQuestions));
+        else updateSheetModeLabel();
+        String hold = gradingHoldReason(outcome);
+        scorePercentText.setText(hold == null ? outcome.scorePercent + "%" : "—");
+        scoreFractionText.setText(hold == null
+            ? "Score: " + outcome.correctCount + " / " + outcome.totalQuestions + " Correct (" + outcome.processingMs + "ms)"
+            : hold);
+        gradeBadgeText.setText(hold != null ? "" : outcome.needsReview ? reviewMessage(outcome)
+            : getGradeWord(outcome.scorePercent) + " • " + outcome.detectedFormName);
+        boolean hasValidId = ScanCapturePolicy.hasCompleteStudentId(outcome.decodedStudentId);
+        String idLabel = hasValidId ? "Student ID: " + outcome.decodedStudentId : "Student ID unresolved • تحقق من الرقم";
+        if (readableLayout && hold == null) idLabel += "   •   Mistakes: " + (outcome.wrongCount + outcome.multipleMarkCount);
+        studentIdText.setText(readableLayout ? idLabel : "");
+        if (updateImage && (outcome.annotatedBitmap != null || hold != null)) {
+            sheetImageView.setImageBitmap(hold == null ? outcome.annotatedBitmap : currentBitmap);
         }
         tabBtnKey.setText("2. Key (" + activeQuestionCount + "Q)");
         tabBtnClass.setText("3. Class (" + classList.size() + ")");
@@ -1239,6 +1339,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         topCard.addView(copyFromPaperBtn, new LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(42)));
 
+        Button useKey = createActionBtn(getString(R.string.use_answer_key), "#065F46", "#FFFFFF");
+        useKey.setOnClickListener(v -> {
+            approvedPrintedKeyCount = activeQuestionCount;
+            hasCustomUserKey = true;
+            invalidatePendingScan();
+            persistState();
+            switchTab(0);
+            if (lastOutcome != null) applyOutcomeToScoreUi(lastOutcome, true);
+        });
+        topCard.addView(useKey, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48)));
         content.addView(topCard);
 
         keyRowsContainer = new LinearLayout(this);
@@ -1292,6 +1402,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                 b.setOnClickListener(new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
+                        invalidatePendingScan();
+                        latestStreamOutcome = lastOutcome = null;
+                        latestNv21Frame = null;
+                        approvedPrintedKeyCount = 0;
                         masterKey[qIndex] = c;
                         hasCustomUserKey = true;
                         persistState();
@@ -1360,6 +1474,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             @Override
             public void onClick(View v) {
                 classList.clear();
+                savedCaptureSignatures.clear();
+                savedStudentContexts.clear();
+                capturePolicy.reset();
                 persistState();
                 refreshClassTabRows();
                 Toast.makeText(MainActivity.this, "Cleared saved class list", Toast.LENGTH_SHORT).show();
@@ -1467,6 +1584,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             scoreTv.setTypeface(Typeface.DEFAULT_BOLD);
             card.addView(scoreTv);
 
+            if (!item.evidence.isEmpty()) {
+                card.setOnClickListener(v -> new AlertDialog.Builder(this)
+                    .setTitle(item.name).setMessage(ReviewedScan.describe(item.evidence))
+                    .setPositiveButton(android.R.string.ok, null).show());
+            }
             classRowsContainer.addView(card, clp);
         }
     }
@@ -1486,11 +1608,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         if (pct >= 90) return "Excellent • ممتاز";
         if (pct >= 75) return "Very Good • جيد جداً";
         if (pct >= 60) return "Pass • ناجح";
-        return "Needs Review • يحتاج مراجعة";
+        return "Below pass mark • دون درجة النجاح";
     }
 
     private void setMasterKeyPreset16Q() {
         char[] k = new char[] {'A','B','B','C','D','D','D','D','C','C','C','B','B','D','D','A'};
+        approvedPrintedKeyCount = 0;
         System.arraycopy(k, 0, masterKey, 0, k.length);
         hasCustomUserKey = false;
         persistState();
@@ -1498,71 +1621,135 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
 
     private void setMasterKeyPreset10Q() {
         char[] k = new char[] {'B','D','B','B','C','A','B','D','D','A'};
+        approvedPrintedKeyCount = 0;
         System.arraycopy(k, 0, masterKey, 0, k.length);
         hasCustomUserKey = false;
         persistState();
     }
 
-    private void updateQuestionCount(int newCount) {
-        activeQuestionCount = Math.max(1, Math.min(100, newCount));
-        currentPresetHint = "CUSTOM";
-        selectedTemplateMode = activeQuestionCount == 100
-            ? "TPL_STD_100Q"
-            : (activeQuestionCount == 50 ? "TPL_STD_50Q" : "CUSTOM");
-        if (!hasCustomUserKey) {
-            if (activeQuestionCount == 10) setMasterKeyPreset10Q();
-            else if (activeQuestionCount == 16) setMasterKeyPreset16Q();
-        }
-        persistState();
-        runOmrPipeline();
-        Toast.makeText(this, "Quiz size set to " + activeQuestionCount + " Questions", Toast.LENGTH_SHORT).show();
-    }
-
     private void copyCurrentPaperToMasterKey() {
         if (lastOutcome == null) return;
-        int copied = 0;
-        for (OmrNativeCvEngine.QuestionResult qr : lastOutcome.questions) {
-            if (!qr.isBlank && qr.markedOptions.length() > 0) {
-                masterKey[qr.questionNumber - 1] = qr.markedOptions.charAt(0);
-                copied++;
+        if (!hasReadableLayout(lastOutcome)) {
+            Toast.makeText(this, reviewMessage(lastOutcome), Toast.LENGTH_LONG).show();
+            return;
+        }
+        for (OmrNativeCvEngine.QuestionResult row : lastOutcome.questions) {
+            if (row.needsReview || row.markedOptions.length() != 1) {
+                Toast.makeText(this, "Check question " + row.questionNumber + " before copying the key", Toast.LENGTH_LONG).show();
+                return;
             }
         }
+        for (OmrNativeCvEngine.QuestionResult row : lastOutcome.questions) {
+            approvedPrintedKeyCount = 0;
+            masterKey[row.questionNumber - 1] = row.markedOptions.charAt(0);
+        }
+        invalidatePendingScan();
+        latestStreamOutcome = lastOutcome = null;
+        latestNv21Frame = null;
         hasCustomUserKey = true;
         persistState();
         runOmrPipeline();
-        Toast.makeText(this, "✓ Copied " + copied + " answers from this paper into the Answer Key!", Toast.LENGTH_LONG).show();
+        refreshKeyTabRows();
     }
 
     private void saveCurrentStudentToClassList() {
-        if (lastOutcome == null) return;
-        String enteredName = studentNameInput.getText().toString().trim();
-        if (enteredName.isEmpty()) {
-            enteredName = "Student #" + (classList.size() + 1);
+        if (lastOutcome != null) saveOutcome(lastOutcome, false);
+    }
+
+    private void saveOutcome(OmrNativeCvEngine.GradeOutcome out, boolean automatic) {
+        if (!ScanCapturePolicy.canSaveLayout(selectedTemplateMode, out.detectedTemplateCode)) {
+            if (!automatic) Toast.makeText(this, hasReadableLayout(out)
+                ? getString(R.string.unsupported_save) : reviewMessage(out), Toast.LENGTH_LONG).show();
+            return;
         }
-        String timeStr = new SimpleDateFormat("HH:mm", Locale.US).format(new Date());
-        classList.add(0, new SavedStudentGrade(
-            enteredName,
-            lastOutcome.decodedStudentId,
-            lastOutcome.correctCount,
-            lastOutcome.totalQuestions,
-            lastOutcome.scorePercent,
-            timeStr
-        ));
-        persistState();
+        if (isDemoImage || !hasReadableLayout(out)) {
+            if (!automatic) Toast.makeText(this, isDemoImage ? "Example sheet • scan a student's paper to save" : reviewMessage(out), Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (CustomSheetLayout.parseCode(out.detectedTemplateCode) > 0 && approvedPrintedKeyCount != out.totalQuestions) {
+            if (!automatic) {
+                activeQuestionCount = out.totalQuestions;
+                if (isStreamOpen && latestNv21Frame != null) snapshotCurrentStreamFrameKeepStreaming(false);
+                switchTab(1);
+                Toast.makeText(this, getString(R.string.review_key_for_count, out.totalQuestions), Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
+        final char[] key = masterKey.clone();
+        final String typedName = automatic ? "" : studentNameInput.getText().toString().trim();
+        if (out.needsReview) {
+            if (!automatic) {
+                // Freeze acquisition while the teacher edits the captured reading.
+                if (isStreamOpen && !isStreamPaused) {
+                    isStreamPaused = true;
+                    invalidatePendingScan();
+                    pauseStreamBtn.setText("▶ Resume");
+                }
+                ScanReviewDialog.show(this, out, key, reviewed -> saveReading(reviewed, out, typedName, key, false));
+            }
+            return;
+        }
+        if (automatic && savedStudentContexts.contains(ScanCapturePolicy.context(
+                out.detectedTemplateCode, out.totalQuestions, key, out.decodedStudentId))) {
+            streamStatusBanner.setText("Different answers for this student • review before saving");
+            return;
+        }
+        saveReading(ReviewedScan.accepted(out, key), out, typedName, key, automatic);
+    }
+
+    private void saveReading(ReviewedScan reading, OmrNativeCvEngine.GradeOutcome original,
+            String typedName, char[] key, boolean automatic) {
+        String context = ScanCapturePolicy.context(original.detectedTemplateCode, reading.totalQuestions, key, reading.studentId);
+        String signature = context + "|" + reading.finalAnswerSignature();
+        String rawSignature = context + "|" + original.answerSignature;
+        if (savedCaptureSignatures.contains(signature) || savedCaptureSignatures.contains(rawSignature)) {
+            if (!automatic) Toast.makeText(this, "This reading is already saved", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String name = typedName.isEmpty() ? "Student " + reading.studentId : typedName;
+        if (savedStudentContexts.contains(context)) {
+            if (automatic) {
+                streamStatusBanner.setText("Different answers for this student • freeze and review before saving");
+            } else {
+                new AlertDialog.Builder(this).setMessage("Save an additional attempt for student " + reading.studentId + "?")
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .setPositiveButton("Save attempt", (dialog, button) -> recordGrade(reading, name, context, signature, rawSignature)).show();
+            }
+            return;
+        }
+        recordGrade(reading, name, context, signature, rawSignature);
+    }
+
+    private void recordGrade(ReviewedScan out, String name, String context, String signature, String rawSignature) {
+        if (!savedCaptureSignatures.add(signature)) return;
+        savedCaptureSignatures.add(rawSignature);
+        boolean newStudent = savedStudentContexts.add(context);
+        classList.add(0, new SavedStudentGrade(name, out.studentId, out.correctCount,
+            out.totalQuestions, out.scorePercent, new SimpleDateFormat("HH:mm", Locale.US).format(new Date()), out.toJson()));
+        if (!persistState()) {
+            classList.remove(0);
+            savedCaptureSignatures.remove(signature);
+            savedCaptureSignatures.remove(rawSignature);
+            if (newStudent) savedStudentContexts.remove(context);
+            Toast.makeText(this, "Could not save. Check available storage and try again.", Toast.LENGTH_LONG).show();
+            return;
+        }
         tabBtnClass.setText("3. Class (" + classList.size() + ")");
-        Toast.makeText(
-            this,
-            "✓ Saved " + enteredName + " (" + lastOutcome.correctCount + "/" + lastOutcome.totalQuestions + " • " + lastOutcome.scorePercent + "%)",
-            Toast.LENGTH_SHORT
-        ).show();
+        Toast.makeText(this, "Saved " + name + " • " + out.correctCount + "/" + out.totalQuestions, Toast.LENGTH_SHORT).show();
+    }
+
+    private static String csvCell(String value) {
+        String trimmed = value.trim();
+        if (!trimmed.isEmpty() && "=+-@".indexOf(trimmed.charAt(0)) >= 0) value = "'" + value;
+        return "\"" + value.replace("\"", "\"\"") + "\"";
     }
 
     private void shareClassGradesCsv() {
         StringBuilder csv = new StringBuilder();
         csv.append("Student Name,Student ID,Correct,Total Questions,Score Percent,Grade,Time\n");
         for (SavedStudentGrade g : classList) {
-            csv.append("\"").append(g.name).append("\",")
-               .append(g.studentId).append(",")
+            csv.append(csvCell(g.name)).append(",")
+               .append(csvCell(g.studentId)).append(",")
                .append(g.correct).append(",")
                .append(g.total).append(",")
                .append(g.percent).append("%,\"")
@@ -1582,6 +1769,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             Bitmap bmp = BitmapFactory.decodeStream(is);
             is.close();
             if (bmp != null) {
+                isDemoImage = true;
                 currentBitmap = bmp;
                 activeQuestionCount = qCount;
                 currentPresetHint = hint;
@@ -1598,37 +1786,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
 
     private void runOmrPipeline() {
         if (currentBitmap == null) return;
-        int qOverride = ("AUTO".equals(currentPresetHint) || "CAMERA".equals(currentPresetHint) || "GALLERY".equals(currentPresetHint))
-            ? 0
-            : activeQuestionCount;
-
+        int qOverride = "AUTO".equals(currentPresetHint) && !hasCustomUserKey ? 0 : activeQuestionCount;
         OmrNativeCvEngine.GradeOutcome initial = OmrNativeCvEngine.gradeSheetBitmap(
-            currentBitmap,
-            qOverride,
-            masterKey,
-            currentPresetHint
-        );
-
-        if (!hasCustomUserKey) {
-            if (initial.is10QForm && masterKey[0] != 'B') {
-                setMasterKeyPreset10Q();
-                initial = OmrNativeCvEngine.gradeSheetBitmap(
-                    currentBitmap,
-                    qOverride,
-                    masterKey,
-                    currentPresetHint
-                );
-            } else if (!initial.is10QForm && initial.totalQuestions == 16 && masterKey[0] != 'A') {
-                setMasterKeyPreset16Q();
-                initial = OmrNativeCvEngine.gradeSheetBitmap(
-                    currentBitmap,
-                    qOverride,
-                    masterKey,
-                    currentPresetHint
-                );
-            }
-        }
-
+            currentBitmap, qOverride, masterKey, currentPresetHint);
         applyOutcomeToScoreUi(initial, true);
     }
 
@@ -1636,6 +1796,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         if (questionBreakdownContainer == null || lastOutcome == null) return;
         questionBreakdownContainer.removeAllViews();
 
+        String hold = gradingHoldReason(lastOutcome);
+        if (hold != null) {
+            TextView status = new TextView(this);
+            status.setText(hold);
+            status.setTextColor(Color.WHITE);
+            questionBreakdownContainer.addView(status);
+            return;
+        }
         styleTabButton(filterAllBtn, !showMistakesOnly);
         styleTabButton(filterMistakesBtn, showMistakesOnly);
 
@@ -1665,7 +1833,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             row.addView(leftTv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
             TextView rightTv = new TextView(this);
-            if (qr.isCorrect) {
+            if (qr.needsReview) {
+                rightTv.setText("Review • " + qr.reviewReason.replace('_', ' ').toLowerCase(Locale.ROOT));
+                rightTv.setTextColor(Color.parseColor("#FDE68A"));
+            } else if (qr.isCorrect) {
                 rightTv.setText("✓ Correct (" + qr.correctOption + ")");
                 rightTv.setTextColor(Color.parseColor("#6EE7B7"));
             } else if (qr.isMultipleMark) {
@@ -1682,7 +1853,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             questionBreakdownContainer.addView(row, rlp);
         }
 
-        if (shown == 0) {
+        if (shown == 0 && !lastOutcome.questions.isEmpty() && !lastOutcome.needsReview) {
             TextView congrats = new TextView(this);
             congrats.setText("🎉 Perfect Score! Zero mistakes on this paper.");
             congrats.setTextColor(Color.parseColor("#6EE7B7"));
@@ -1735,12 +1906,49 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         if (resultCode != RESULT_OK || data == null) return;
 
         try {
-            if (requestCode == REQ_CAMERA_CAPTURE && data.getExtras() != null) {
+            int requestedCount = requestCode - REQ_CUSTOM_PDF_BASE;
+            if (CustomSheetLayout.validCount(requestedCount)) {
+                if (data.getData() == null) return;
+                try (OutputStream output = getContentResolver().openOutputStream(data.getData(), "wt")) {
+                    if (output == null) throw new IOException("Document provider returned no stream");
+                    CustomSheetPdf.write(output, requestedCount);
+                } catch (IOException | RuntimeException e) {
+                    Toast.makeText(this, R.string.pdf_write_failed, Toast.LENGTH_LONG).show();
+                    return;
+                }
+                currentBitmap = null;
+                isDemoImage = false;
+                sheetImageView.setImageDrawable(null);
+                selectTemplateMode(CustomSheetLayout.code(requestedCount), requestedCount, false);
+                approvedPrintedKeyCount = 0;
+                persistState();
+                scorePercentText.setText("—");
+                scoreFractionText.setText(getString(R.string.review_key_for_count, requestedCount));
+                studentIdText.setText("");
+                gradeBadgeText.setText("");
+                questionBreakdownContainer.removeAllViews();
+                Toast.makeText(this, getString(R.string.custom_pdf_saved, requestedCount), Toast.LENGTH_LONG).show();
+            } else if (requestCode == REQ_EXPORT_10Q || requestCode == REQ_EXPORT_16Q) {
+                if (data.getData() == null) return;
+                String asset = requestCode == REQ_EXPORT_10Q ? "forms/sheetx_10q.pdf" : "forms/sheetx_16q.pdf";
+                try (InputStream input = getAssets().open(asset);
+                     OutputStream output = getContentResolver().openOutputStream(data.getData(), "wt")) {
+                    if (output == null) throw new IOException("Could not open document");
+                    byte[] buffer = new byte[8192];
+                    int length;
+                    while ((length = input.read(buffer)) != -1) output.write(buffer, 0, length);
+                } catch (IOException e) {
+                    Toast.makeText(this, "Could not write the PDF. Choose the destination again.", Toast.LENGTH_LONG).show();
+                    return;
+                }
+                Toast.makeText(this, "Sheet saved. Print at 100% on A4.", Toast.LENGTH_LONG).show();
+            } else if (requestCode == REQ_CAMERA_CAPTURE && data.getExtras() != null) {
                 Bitmap photo = (Bitmap) data.getExtras().get("data");
                 if (photo != null) {
+                    isDemoImage = false;
                     currentBitmap = photo;
-                    currentPresetHint = "CAMERA";
-                    studentNameInput.setText("Scanned Student");
+                    currentPresetHint = selectedTemplateMode;
+                    studentNameInput.setText("");
                     runOmrPipeline();
                 }
             } else if (requestCode == REQ_PICK_IMAGE && data.getData() != null) {
@@ -1766,8 +1974,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
 
                 if (bmp != null) {
                     currentBitmap = bmp;
-                    currentPresetHint = "GALLERY";
-                    studentNameInput.setText("Photo Student");
+                    isDemoImage = false;
+                    currentPresetHint = selectedTemplateMode;
+                    studentNameInput.setText("");
                     runOmrPipeline();
                 }
             }
